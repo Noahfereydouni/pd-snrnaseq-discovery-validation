@@ -1,0 +1,367 @@
+---
+title: "Single-Nucleus RNA-seq QC: Parkinson's Disease vs Control"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+subtitle: "This project investigates the single-nucleus RNA sequencing (snRNA-seq) data from the human substantia nigra (dataset GSE157783)."
+---
+
+```{r warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# 1. Loading and QC
+```{r warning=FALSE}
+library(Seurat)
+library(Matrix)
+library(data.table)
+library(ggplot2)
+library(scDblFinder)
+library(SingleCellExperiment)
+library(clusterProfiler)
+library(org.Hs.eg.db) # This is the Human Genome database!
+library(enrichplot)
+library(ggplot2)
+
+# 1. Load Data
+barcodes_df <- fread("~/Desktop/PD_Project_Fresh/barcodes_FIXED.tsv", header = TRUE)
+features_df <- fread("~/Desktop/PD_Project_Fresh/features_FIXED.tsv", header = TRUE)
+
+cell_names <- as.character(barcodes_df$barcode)
+
+# ROOT FIX: Translate Ensembl IDs to Gene Symbols immediately upon loading
+raw_genes <- as.character(features_df$gene)
+if (any(grepl("^ENSG", raw_genes))) {
+  message("Translating Ensembl IDs to official gene symbols using org.Hs.eg.db...")
+  mapped_syms <- mapIds(org.Hs.eg.db,
+                        keys = raw_genes,
+                        column = "SYMBOL",
+                        keytype = "ENSEMBL",
+                        multiVals = "first")
+  gene_names <- make.unique(ifelse(is.na(mapped_syms), raw_genes, mapped_syms))
+} else {
+  gene_names <- make.unique(raw_genes)
+}
+
+n_cells <- length(cell_names)
+chunk_size <- 5000
+col_indices <- 1:n_cells
+chunks <- split(col_indices, ceiling(seq_along(col_indices) / chunk_size))
+full_sparse_matrix <- NULL
+
+for (i in seq_along(chunks)) {
+  dt_chunk <- fread("~/Desktop/PD_Project_Fresh/matrix.mtx", select = chunks[[i]], header = FALSE, skip = 1)
+  mat_chunk <- as.matrix(dt_chunk)
+  sp_chunk <- as(mat_chunk, "dgCMatrix")
+
+  if (is.null(full_sparse_matrix)) {
+    full_sparse_matrix <- sp_chunk
+  } else {
+    full_sparse_matrix <- cbind(full_sparse_matrix, sp_chunk)
+  }
+  rm(dt_chunk, mat_chunk, sp_chunk); gc()
+}
+
+rownames(full_sparse_matrix) <- gene_names[1:nrow(full_sparse_matrix)]
+colnames(full_sparse_matrix) <- cell_names[1:ncol(full_sparse_matrix)]
+
+pd_full <- CreateSeuratObject(counts = full_sparse_matrix, project = "PD_GSE157783")
+
+# 2. Metadata
+pd_full$Patient_ID <- barcodes_df$patient
+pd_full$Condition <- ifelse(grepl("PD", pd_full$Patient_ID), "PD", "Control")
+
+# 3. Doublet Detection
+sce <- as.SingleCellExperiment(pd_full)
+sce <- scDblFinder(sce, samples="Patient_ID")
+pd_full$Doublet_Class <- sce$scDblFinder.class
+
+# 4. Filter and Clean
+pd_clean <- subset(pd_full, subset = Doublet_Class == "singlet")
+pd_clean <- subset(pd_clean, subset = nFeature_RNA > 200 & nFeature_RNA < 9000)
+
+# Verify PBX1 is present right from the start
+print(paste("Is PBX1 present globally?", "PBX1" %in% rownames(pd_clean)))
+
+# Clean up intermediate heavy objects
+rm(sce, full_sparse_matrix)
+gc()
+```
+
+##2. Normalization and PCA
+```{r warning=FALSE}
+library(patchwork)
+
+# Ensure standard RNA assay is active and layers are joined
+DefaultAssay(pd_clean) <- "RNA"
+pd_clean <- JoinLayers(pd_clean)
+
+# THE MISSING PIECE: Normalize the data so Seurat do the math!
+pd_clean <- NormalizeData(pd_clean)
+
+# Find variable features and explicitly SCALE DATA
+pd_clean <- FindVariableFeatures(pd_clean, selection.method = "vst", nfeatures = 2000)
+pd_clean <- ScaleData(pd_clean)
+
+# Run PCA
+pd_clean <- RunPCA(pd_clean, verbose = FALSE)
+
+p1 <- DimPlot(pd_clean, reduction = "pca", group.by = "Patient_ID") +
+ggtitle("PCA by Donor") + theme(aspect.ratio = 1)
+p2 <- DimPlot(pd_clean, reduction = "pca", group.by = "Condition") +
+ggtitle("PCA by Condition") + theme(aspect.ratio = 1)
+
+p1 + p2
+```
+
+##3. Harmony Integration
+```{r warning=FALSE}
+library(harmony)
+library(patchwork) # Required for the p3 + p4 layout below
+
+# 1. Calculate the PCA map first!
+pd_clean <- RunPCA(pd_clean, npcs = 30, verbose = FALSE)
+
+# 2. Run Harmony to integrate the patients (using the updated, clean command)
+pd_clean <- RunHarmony(pd_clean, group.by.vars = "Patient_ID")
+
+# 3. Draw your Validation Plots
+p3 <- DimPlot(pd_clean, reduction = "harmony", group.by = "Patient_ID") +
+ ggtitle("Harmony by Donor") + theme(aspect.ratio = 1)
+
+p4 <- DimPlot(pd_clean, reduction = "harmony", group.by = "Condition") +
+ ggtitle("Harmony by Condition") + theme(aspect.ratio = 1)
+
+# Display the plots side-by-side
+p3 + p4 + plot_layout(guides = "collect")
+```
+
+##4. Clustering, Markers, and Annotation
+
+```{r warning=FALSE}
+library(Seurat)
+library(ggplot2)
+
+# 1. Reset the foundation to ensure R knows where to build the graph
+DefaultAssay(pd_clean) <- "RNA"
+
+# 2. Build the mathematical network based on the Harmony integration
+pd_clean <- FindNeighbors(pd_clean, reduction = "harmony", dims = 1:30)
+
+# 3. Find Clusters. We explicitly tell Seurat to use the newly built RNA_snn graph to bypass the error.
+pd_clean <- FindClusters(pd_clean, resolution = 0.6, graph.name = "RNA_snn")
+
+# 4. Generate the UMAP coordinates
+pd_clean <- RunUMAP(pd_clean, reduction = "harmony", dims = 1:30)
+
+# 5. Apply your updated, biologically verified dictionary (DA Neurons secured)
+new.cluster.ids <- c(
+"0" = "Oligodendrocytes",
+ "1" = "Astrocytes",
+ "2" = "Oligodendrocytes",
+ "3" = "Oligodendrocytes",
+ "4" = "Excitatory Neurons",
+ "5" = "Microglia",
+ "6" = "OPCs",
+ "7" = "Oligodendrocytes",
+ "8" = "Unknown",
+ "9" = "Endothelial",
+ "10" = "Pericytes",
+ "11" = "Neurons (SYNPR+)",
+ "12" = "Ependymal",
+ "13" = "Neurons (KCNC2+)",
+ "14" = "Low Quality",
+ "15" = "Unknown",
+ "16" = "Excitatory Neurons",
+ "17" = "Fibroblasts / VLMCs",
+ "18" = "Unknown",
+ "19" = "Dopaminergic Neurons",
+ "20" = "Neurons (STMN2+)",
+ "21" = "Oligodendrocytes (LINC01608+)"
+)
+
+# 6. Match the levels and rename the clusters
+names(new.cluster.ids) <- levels(pd_clean)
+pd_clean <- RenameIdents(pd_clean, new.cluster.ids)
+
+# 7. Save the fully baked, annotated object for your pipeline
+saveRDS(pd_clean, file = "PD_40k_Fully_Annotated_FIXED.rds")
+
+# 8. Generate and display the final annotated UMAP
+DimPlot(pd_clean, reduction = "umap", label = TRUE, pt.size = 0.5, label.size = 3, repel = TRUE) +
+ggtitle("Annotated UMAP of Human Substantia Nigra (GSE157783)") +
+NoLegend()
+pd_clean <- RunUMAP(pd_clean, reduction = "harmony", dims = 1:30, seed.use = 42)
+```
+
+
+#Step 2: Differential Expression (PD vs Control)
+#Now that the clusters are biologically annotated, we will identify the genes driving Parkinson's Disease specifically within the Dopaminergic Neurons.
+
+```{r warning=FALSE}
+# ==========================================
+# STEP 2: DIFFERENTIAL EXPRESSION & FEATURE MAPPING
+# ==========================================
+library(Seurat)
+
+# 2. Run Differential Expression for Dopaminergic Neurons
+da_neurons_de <- FindMarkers(pd_clean,
+                             ident.1 = "PD",
+                             ident.2 = "Control",
+                             group.by = "Condition",
+                             subset.ident = "Dopaminergic Neurons")
+
+da_neurons_de <- da_neurons_de[order(da_neurons_de$p_val_adj), ]
+head(da_neurons_de, n = 10)
+
+# ==========================================
+# 3. DOPAMINERGIC NEURONS: VIOLIN PLOTS
+# ==========================================
+dying_genes <- subset(da_neurons_de, avg_log2FC < 0)
+dying_genes <- dying_genes[order(dying_genes$p_val_adj), ]
+head(dying_genes, n = 10)
+
+plot_pbx1 <- VlnPlot(pd_clean,
+                    features = "PBX1",
+                    split.by = "Condition",
+                    idents = "Dopaminergic Neurons",
+                    pt.size = 0.1) +
+  ggtitle("PBX1 (Survival Gene)")
+
+plot_en2 <- VlnPlot(pd_clean,
+                   features = "EN2",
+                   split.by = "Condition",
+                   idents = "Dopaminergic Neurons",
+                   pt.size = 0.1) +
+  ggtitle("EN2 (Survival Gene)")
+
+plot_pbx1 | plot_en2
+
+VlnPlot(pd_clean,
+        features = "LINGO1",
+        split.by = "Condition",
+        idents = "Dopaminergic Neurons",
+        pt.size = 0.1) +
+  ggtitle("LINGO1 (Dying Structural Gene)")
+
+# ==========================================
+# 4. MICROGLIA ANALYSIS
+# ==========================================
+microglia_de <- FindMarkers(pd_clean,
+                            ident.1 = "PD",
+                            ident.2 = "Control",
+                            group.by = "Condition",
+                            subset.ident = "Microglia")
+
+microglia_de$Gene_Symbol <- rownames(microglia_de)
+microglia_de <- microglia_de[, c("Gene_Symbol", "p_val", "avg_log2FC", "pct.1", "pct.2", "p_val_adj")]
+
+microglia_up <- subset(microglia_de, avg_log2FC > 0)
+microglia_up <- microglia_up[order(microglia_up$p_val_adj), ]
+
+microglia_down <- subset(microglia_de, avg_log2FC < 0)
+microglia_down <- microglia_down[order(microglia_down$p_val_adj), ]
+
+VlnPlot(pd_clean,
+        features = "CHI3L1",
+        split.by = "Condition",
+        idents = "Microglia",
+        pt.size = 0.1) +
+  ggtitle("CHI3L1 (Microglia Inflammation)")
+
+# ==========================================
+# 5. ASTROCYTES ANALYSIS
+# ==========================================
+astro_de <- FindMarkers(pd_clean, 
+                        ident.1 = "PD", 
+                        ident.2 = "Control", 
+                        group.by = "Condition", 
+                        subset.ident = "Astrocytes")
+
+astro_de$Gene_Symbol <- rownames(astro_de)
+astro_de <- astro_de[, c("Gene_Symbol", "p_val", "avg_log2FC", "pct.1", "pct.2", "p_val_adj")]
+
+VlnPlot(pd_clean,
+        features = "NEAT1",
+        split.by = "Condition",
+        idents = "Astrocytes",
+        pt.size = 0.1) +
+  ggtitle("NEAT1 (Astrocyte Stress Marker)")
+
+# ==========================================
+# 6. OLIGODENDROCYTES ANALYSIS
+# ==========================================
+oligo_de <- FindMarkers(pd_clean, 
+                        ident.1 = "PD", 
+                        ident.2 = "Control", 
+                        group.by = "Condition", 
+                        subset.ident = "Oligodendrocytes")
+
+oligo_de$Gene_Symbol <- rownames(oligo_de)
+oligo_de <- oligo_de[, c("Gene_Symbol", "p_val", "avg_log2FC", "pct.1", "pct.2", "p_val_adj")]
+
+VlnPlot(pd_clean,
+        features = "MOBP",
+        split.by = "Condition",
+        idents = "Oligodendrocytes",
+        pt.size = 0.1) +
+  ggtitle("MOBP (Failing Myelin Structure)")
+```
+
+
+
+
+
+
+```{r eval=FALSE, warning=FALSE}
+# ==========================================
+# STEP 3a: RAW DATA QC & FILTERING (DOCUMENTATION)
+# ==========================================
+pd_full[["percent.mt"]] <- PercentageFeatureSet(pd_full, pattern = "^MT-")
+qc_plot <- VlnPlot(pd_full, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, pt.size = 0)
+qc_plot
+pd_filtered <- subset(pd_full, subset = nFeature_RNA > 500 & nFeature_RNA < 8000)
+pd_filtered <- SCTransform(pd_filtered, verbose = TRUE)
+```
+
+```{r warning=FALSE}
+# ==========================================
+# 7. OPCs ANALYSIS
+# ==========================================
+opc_de <- FindMarkers(pd_clean, 
+                      ident.1 = "PD", 
+                      ident.2 = "Control", 
+                      group.by = "Condition", 
+                      subset.ident = "OPCs")
+
+opc_de$Gene_Symbol <- rownames(opc_de)
+opc_de <- opc_de[, c("Gene_Symbol", "p_val", "avg_log2FC", "pct.1", "pct.2", "p_val_adj")]
+```
+
+```{r warning=FALSE}
+# ====================================================================
+# FINAL DIFFERENTIAL EXPRESSION EXPORTS (CORRECTED)
+# ====================================================================
+
+# 1. Dopaminergic Neurons (Using your actual GSE157783 object: da_neurons_de)
+write.csv(da_neurons_de, "~/Desktop/PD_Project_Fresh/DE_Dopaminergic_Neurons.csv", row.names = TRUE)
+
+# 2. Microglia
+write.csv(microglia_de, "~/Desktop/PD_Project_Fresh/DE_Microglia.csv", row.names = TRUE)
+
+# 3. Astrocytes
+write.csv(astro_de, "~/Desktop/PD_Project_Fresh/DE_Astrocytes.csv", row.names = TRUE)
+
+# 4. Oligodendrocytes
+write.csv(oligo_de, "~/Desktop/PD_Project_Fresh/DE_Oligodendrocytes.csv", row.names = TRUE)
+
+# 5. OPCs
+write.csv(opc_de, "~/Desktop/PD_Project_Fresh/OPCs_Pseudobulk_Results.csv", row.names = TRUE)
+```
+
+   

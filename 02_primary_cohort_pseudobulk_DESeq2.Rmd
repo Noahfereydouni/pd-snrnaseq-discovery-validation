@@ -1,0 +1,260 @@
+---
+title: "Integrated Single-Nucleus and Pseudobulk Analysis"
+author: "Nika Abravan"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+subtitle: "GSE157783: Parkinson's Disease vs Control (Substantia Nigra)"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+```
+
+# Part 1: Single-Nucleus RNA-seq Pipeline
+
+## 1. Data Loading and Quality Control (QC)
+
+The raw count matrices were loaded in chunks to optimize memory. Using `scDblFinder`, doublets were identified and removed. We then applied stringent quality control to remove empty droplets, doublets, and dying/stressed cells by filtering based on feature counts and mitochondrial reads.
+
+```{r qc_filtering}
+library(Seurat)
+library(Matrix)
+library(data.table)
+library(scDblFinder)
+library(SingleCellExperiment)
+
+# Load Data (Assuming files are in the working directory)
+barcodes_df <- fread("barcodes_FIXED.tsv", header = TRUE)
+features_df <- fread("features_FIXED.tsv", header = TRUE)
+
+cell_names <- as.character(barcodes_df$barcode)
+gene_names <- make.unique(as.character(features_df$gene))
+
+n_cells <- length(cell_names)
+chunk_size <- 5000
+chunks <- split(1:n_cells, ceiling(seq_along(1:n_cells) / chunk_size))
+full_sparse_matrix <- NULL
+
+for (i in seq_along(chunks)) {
+  dt_chunk <- fread("matrix.mtx", select = chunks[[i]], header = FALSE, skip = 1)
+  sp_chunk <- as(as.matrix(dt_chunk), "dgCMatrix")
+  
+  if (is.null(full_sparse_matrix)) {
+    full_sparse_matrix <- sp_chunk
+  } else {
+    full_sparse_matrix <- cbind(full_sparse_matrix, sp_chunk)
+  }
+  rm(dt_chunk, sp_chunk); gc()
+}
+
+rownames(full_sparse_matrix) <- gene_names[1:nrow(full_sparse_matrix)]
+colnames(full_sparse_matrix) <- cell_names[1:ncol(full_sparse_matrix)]
+
+pd_full <- CreateSeuratObject(counts = full_sparse_matrix, project = "PD_GSE157783")
+pd_full$Patient_ID <- barcodes_df$patient
+pd_full$Condition <- ifelse(grepl("PD", pd_full$Patient_ID), "PD", "Control")
+
+# Doublet Detection
+sce <- as.SingleCellExperiment(pd_full)
+sce <- scDblFinder(sce, samples="Patient_ID")
+pd_full$Doublet_Class <- sce$scDblFinder.class
+
+# Strict QC Filtering (Features & Mitochondrial)
+pd_full[["percent.mt"]] <- PercentageFeatureSet(pd_full, pattern = "^MT-")
+pd_clean <- subset(pd_full, subset = Doublet_Class == "singlet" & nFeature_RNA > 500 & nFeature_RNA < 8000 & percent.mt < 5)
+
+rm(pd_full, sce, full_sparse_matrix); gc()
+
+```
+
+## 2. Normalization, PCA, and Harmony Integration
+
+To prepare the dataset for integration and clustering, the raw counts were normalized. We then applied Harmony integration across the `Patient_ID` variable to correct for donor-specific batch effects.
+
+```{r integration}
+library(harmony)
+library(patchwork)
+
+# Normalize and Scale
+pd_clean <- NormalizeData(pd_clean)
+pd_clean <- FindVariableFeatures(pd_clean, selection.method = "vst", nfeatures = 2000)
+pd_clean <- ScaleData(pd_clean)
+
+# PCA & Harmony
+pd_clean <- RunPCA(pd_clean, npcs = 30, verbose = FALSE)
+pd_clean <- RunHarmony(pd_clean, group.by.vars = "Patient_ID")
+
+```
+
+## 3. Clustering and Annotation
+
+Using the Harmony embeddings, a shared nearest neighbor (SNN) graph was constructed to cluster the cells and visualize them via UMAP.
+
+```{r clustering}
+library(dplyr)
+library(ggplot2)
+library(org.Hs.eg.db)
+
+# Clustering
+pd_clean <- FindNeighbors(pd_clean, reduction = "harmony", dims = 1:30)
+pd_clean <- FindClusters(pd_clean, resolution = 0.6)
+pd_clean <- RunUMAP(pd_clean, reduction = "harmony", dims = 1:30)
+
+# Cell Type Annotation (Mapping to HCA Reference)
+new.cluster.ids <- c(
+  "0" = "Oligodendrocytes", "1" = "Astrocytes", "5" = "Microglia",
+  "6" = "OPCs", "9" = "Endothelial", "15" = "Dopaminergic Neurons"
+)
+# Note: Unlisted clusters remain their default numeric ID for this pipeline scope.
+pd_clean <- RenameIdents(pd_clean, new.cluster.ids)
+pd_clean$Cell_Type <- Idents(pd_clean)
+
+DimPlot(pd_clean, reduction = "umap", label = TRUE, pt.size = 0.5, repel = TRUE) + 
+  ggtitle("Annotated UMAP of Human Brain Nuclei") + NoLegend()
+
+```
+
+---
+
+# Part 2: Pseudobulk Validation (DESeq2)
+
+To ensure the robustness of the molecular signatures differentiating PD from healthy controls, expression profiles were aggregated by patient and analyzed using DESeq2.
+
+```{r pseudobulk_prep}
+# Aggregate Expression by Cell Type and Patient
+pseudobulk_matrix <- AggregateExpression(
+  pd_clean, 
+  group.by = c("Cell_Type", "Patient_ID"), 
+  return.seurat = FALSE
+)
+bulk_counts <- pseudobulk_matrix$RNA
+
+```
+
+## 1. Microglia Validation
+
+```{r microglia_deseq2}
+library(DESeq2)
+
+microglia_cols <- grep("^Microglia_", colnames(bulk_counts), value = TRUE)
+microglia_counts <- bulk_counts[, microglia_cols]
+
+patient_ids <- gsub("Microglia_", "", colnames(microglia_counts))
+conditions <- ifelse(grepl("PD", patient_ids), "PD", "Control")
+
+microglia_metadata <- data.frame(
+  row.names = colnames(microglia_counts),
+  Condition = factor(conditions, levels = c("Control", "PD")) 
+)
+
+dds_microglia <- DESeqDataSetFromMatrix(countData = microglia_counts, colData = microglia_metadata, design = ~ Condition)
+dds_microglia <- dds_microglia[rowSums(counts(dds_microglia)) >= 10,]
+dds_microglia <- DESeq(dds_microglia)
+
+res_microglia <- results(dds_microglia, contrast = c("Condition", "PD", "Control"))
+res_microglia_ordered <- res_microglia[order(res_microglia$padj),]
+res_microglia_ordered$Gene_Symbol <- mapIds(org.Hs.eg.db, keys = rownames(res_microglia_ordered), column = "SYMBOL", keytype = "ENSEMBL", multiVals = "first")
+
+res_micro_df <- cbind(Gene_Symbol = res_microglia_ordered$Gene_Symbol, as.data.frame(res_microglia_ordered))
+head(res_micro_df, 5)
+
+```
+
+**Biological Interpretation: Microglial Activation**
+The differential expression profile within the pseudobulked microglia firmly indicates a state of chronic neuroinflammation. The significant upregulation of targets such as *CHI3L1* reflects an active immune response, likely driven by severe proteostatic stress and an increased demand for lysosomal clearance in the Parkinsonian substantia nigra.
+
+## 2. Astrocyte Validation
+
+```{r astro_deseq2}
+astro_cols <- grep("^Astrocytes_", colnames(bulk_counts), value = TRUE)
+astro_counts <- bulk_counts[, astro_cols]
+
+patient_ids_astro <- gsub("Astrocytes_", "", colnames(astro_counts))
+conditions_astro <- ifelse(grepl("PD", patient_ids_astro), "PD", "Control")
+
+astro_metadata <- data.frame(
+  row.names = colnames(astro_counts),
+  Condition = factor(conditions_astro, levels = c("Control", "PD"))
+)
+
+dds_astro <- DESeqDataSetFromMatrix(countData = astro_counts, colData = astro_metadata, design = ~ Condition)
+dds_astro <- dds_astro[rowSums(counts(dds_astro)) >= 10, ]
+dds_astro <- DESeq(dds_astro)
+
+res_astro <- results(dds_astro, contrast = c("Condition", "PD", "Control"))
+res_astro_ordered <- res_astro[order(res_astro$padj),]
+res_astro_ordered$Gene_Symbol <- mapIds(org.Hs.eg.db, keys = rownames(res_astro_ordered), column = "SYMBOL", keytype = "ENSEMBL", multiVals = "first")
+
+res_astro_df <- cbind(Gene_Symbol = res_astro_ordered$Gene_Symbol, as.data.frame(res_astro_ordered))
+write.csv(res_astro_df, "Astrocytes_Pseudobulk_Results.csv", row.names = FALSE)
+head(res_astro_df, 5)
+
+```
+
+**Biological Interpretation: Astrocyte Metabolic Stress**
+The transcriptomic shift in astrocytes points to severe cellular stress and altered metabolic support. The prominent upregulation of *NEAT1*, a long non-coding RNA crucial for paraspeckle formation and stress response, suggests these glial cells are actively reacting to the toxic microenvironment, compromising their ability to perform baseline lipid metabolism.
+
+## 3. Oligodendrocyte / OPC Validation
+
+```{r opc_deseq2}
+opc_cols <- grep("^OPCs_", colnames(bulk_counts), value = TRUE)
+opc_counts <- bulk_counts[, opc_cols]
+
+patient_ids_opc <- gsub("OPCs_", "", colnames(opc_counts))
+conditions_opc <- ifelse(grepl("PD", patient_ids_opc), "PD", "Control")
+
+opc_metadata <- data.frame(
+  row.names = colnames(opc_counts),
+  Condition = factor(conditions_opc, levels = c("Control", "PD"))
+)
+
+dds_opc <- DESeqDataSetFromMatrix(countData = opc_counts, colData = opc_metadata, design = ~ Condition)
+dds_opc <- dds_opc[rowSums(counts(dds_opc)) >= 10, ]
+dds_opc <- DESeq(dds_opc)
+
+res_opc <- results(dds_opc, contrast = c("Condition", "PD", "Control"))
+res_opc_ordered <- res_opc[order(res_opc$padj),]
+res_opc_ordered$Gene_Symbol <- mapIds(org.Hs.eg.db, keys = rownames(res_opc_ordered), column = "SYMBOL", keytype = "ENSEMBL", multiVals = "first")
+
+res_opc_df <- cbind(Gene_Symbol = res_opc_ordered$Gene_Symbol, as.data.frame(res_opc_ordered))
+write.csv(res_opc_df, "OPCs_Pseudobulk_Results.csv", row.names = FALSE)
+head(res_opc_df, 5)
+
+```
+
+**Biological Interpretation: Oligodendroglial Structural Collapse**
+The pathway alterations observed in the OPC and oligodendrocyte populations reveal a critical breakdown in structural support systems. The significant downregulation of structural markers like *MOBP* highlights an ongoing failure in myelin maintenance, leaving dopaminergic axons highly vulnerable to degeneration.
+
+---
+
+## 4. Pathway Enrichment (Gene Ontology)
+
+To evaluate the functional implications of the astrocyte signatures, a Gene Ontology (GO) enrichment analysis was performed on the DESeq2 outputs.
+
+```{r go_enrichment}
+library(clusterProfiler)
+library(ggplot2)
+
+sig_astro_broad <- subset(res_astro_df, pvalue < 0.05 & !is.na(Gene_Symbol))
+significant_genes_broad <- sig_astro_broad$Gene_Symbol
+
+ego_astro_broad <- enrichGO(
+  gene          = significant_genes_broad,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",  
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+
+dotplot(ego_astro_broad, showCategory = 10, title = "Top Enriched Pathways in Astrocytes (PD vs Control)")
+
+```

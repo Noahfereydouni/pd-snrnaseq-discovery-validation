@@ -1,0 +1,309 @@
+---
+title: "Pathway_Enrichment.Rmd"
+author: "Nika Abravan"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r, message=FALSE, warning=FALSE}
+# PHASE 4a: RANKING PD-ASSOCIATED GENES ACROSS CELL TYPES
+# ====================================================================
+
+# 1. Load the data manipulation toolbelt
+library(dplyr)
+
+# 2. Load all four of  exported CSV files
+
+microglia  <- read.csv("~/Desktop/PD_Project_Fresh/DE_Microglia.csv", row.names = 1)
+astrocytes <- read.csv("~/Desktop/PD_Project_Fresh/DE_Astrocytes.csv", row.names = 1)
+oligo      <- read.csv("~/Desktop/PD_Project_Fresh/DE_Oligodendrocytes.csv", row.names = 1)
+neurons    <- read.csv("~/Desktop/PD_Project_Fresh/DE_Dopaminergic_Neurons.csv", row.names = 1)
+
+
+# require p_val_adj < 0.05 (significant) AND a log2FC > 0.25 (large effect)
+filter_and_rank <- function(df) {
+  df %>%
+    filter(p_val_adj < 0.05 & abs(avg_log2FC) > 0.25) %>%
+    arrange(p_val_adj) #it Sorts them so the  strongest genes are at the top
+}
+
+# 4. Apply the filter to all four cell types
+microglia_sig  <- filter_and_rank(microglia)
+astrocytes_sig <- filter_and_rank(astrocytes)
+oligo_sig      <- filter_and_rank(oligo)
+neurons_sig    <- filter_and_rank(neurons)
+
+# 5. Print the top 5 most critical broken genes in the Microglia to the console
+print("Top 5 Most Significant PD Genes in Microglia:")
+head(microglia_sig, 5)
+```
+
+
+```{r, fig.width=10, fig.height=7, message=FALSE, warning=FALSE}
+# ====================================================================
+# PHASE 4b: PATHWAY ENRICHMENT (MICROGLIA)
+# ====================================================================
+
+# 1. Loading  biological analysis libraries 
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ggplot2)
+
+# 2. Extract the gene names from filtered Microglia list
+microglia_genes <- microglia_sig$Gene_Symbol
+
+# 3. Translate the Gene Symbols into Entrez IDs 
+
+microglia_entrez <- mapIds(org.Hs.eg.db, 
+                           keys = microglia_genes, 
+                           column = "ENTREZID", 
+                           keytype = "SYMBOL", 
+                           multiVals = "first")
+
+# cleaning any genes that didn't translate perfectly
+microglia_entrez <- na.omit(microglia_entrez)
+
+# 4. Run the Gene Ontology (GO) Biological Process Enrichment
+# This asks the database: "What systems do these broken genes belong to?"
+microglia_go <- enrichGO(gene          = microglia_entrez,
+                         OrgDb         = org.Hs.eg.db,
+                         ont           = "BP", # BP = Biological Process
+                         pAdjustMethod = "BH",
+                         pvalueCutoff  = 0.05,
+                         readable      = TRUE)
+
+# 5. plot 
+# This plots top 15 malfunctioning biological systems
+dotplot(microglia_go, showCategory = 15) + 
+  ggtitle("Microglia: Top PD-Associated Biological Pathways") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.text.y = element_text(size = 11)) # make it cleaner graph
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+# ====================================================================
+# PHASE 4d: GSEA (dopaminergic neurons)
+
+library(dplyr)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ggplot2)
+
+# 1. Load the full dataset
+neurons_full <- read.csv("~/Desktop/PD_Project_Fresh/DE_Dopaminergic_Neurons.csv", row.names = 1)
+
+# 2. Translate to Entrez IDs
+neurons_full$Entrez <- mapIds(org.Hs.eg.db, 
+                              keys = neurons_full$Gene_Symbol, 
+                              column = "ENTREZID", 
+                              keytype = "SYMBOL", 
+                              multiVals = "first")
+
+# Remove any genes that didn't translate
+neurons_full <- neurons_full[!is.na(neurons_full$Entrez), ]
+
+# 3. THE FIX: Collapse duplicate barcodes by averaging their log2FC
+neurons_clean <- neurons_full %>%
+  group_by(Entrez) %>%
+  summarize(avg_log2FC = mean(avg_log2FC, na.rm = TRUE)) %>%
+  ungroup()
+
+# 4. Build the strictly unique Ranked List
+ranked_list <- neurons_clean$avg_log2FC
+names(ranked_list) <- as.character(neurons_clean$Entrez)
+ranked_list <- sort(ranked_list, decreasing = TRUE)
+
+# 5. Run the GSEA Math 
+# We set seed so the random permutations are exactly reproducible
+set.seed(1234) 
+neurons_gsea <- gseGO(geneList     = ranked_list,
+                      OrgDb        = org.Hs.eg.db,
+                      ont          = "BP", 
+                      minGSSize    = 10,
+                      maxGSSize    = 500,
+                      pvalueCutoff = 0.05,
+                      verbose      = FALSE)
+
+# 6. Draw the GSEA Plot for Noah
+dotplot(neurons_gsea, showCategory = 10, split=".sign") + facet_grid(.~.sign) +
+  ggtitle("Dopaminergic Neurons: GSEA Pathway Analysis") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+
+
+```{r, fig.width=10, fig.height=7, message=FALSE, warning=FALSE}
+# ====================================================================
+# PHASE 4e: PATHWAY ENRICHMENT (ASTROCYTES)
+
+# 1. Load the biological analysis toolbelt
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ggplot2)
+library(dplyr)
+
+# 2. Load the Astrocytes CSV
+astrocytes_de <- read.csv("~/Desktop/PD_Project_Fresh/DE_Astrocytes.csv", row.names = 1)
+
+# 3. Filter for ONLY the significantly altered genes
+astrocytes_sig <- astrocytes_de %>%
+  filter(p_val_adj < 0.05 & abs(avg_log2FC) > 0.25)
+
+# 4. Extract just the gene names
+astrocytes_genes <- astrocytes_sig$Gene_Symbol
+
+# 5. Translate the Gene Symbols into Entrez IDs 
+astrocytes_entrez <- mapIds(org.Hs.eg.db, 
+                            keys = astrocytes_genes, 
+                            column = "ENTREZID", 
+                            keytype = "SYMBOL", 
+                            multiVals = "first")
+
+# Clean up genes that didn't translate perfectly
+astrocytes_entrez <- na.omit(astrocytes_entrez)
+
+# 6. Run the Gene Ontology (GO) Biological Process Enrichment
+astrocytes_go <- enrichGO(gene          = astrocytes_entrez,
+                          OrgDb         = org.Hs.eg.db,
+                          ont           = "BP", # BP = Biological Process
+                          pAdjustMethod = "BH",
+                          pvalueCutoff  = 0.05,
+                          readable      = TRUE)
+
+# 7. Plot 
+dotplot(astrocytes_go, showCategory = 15) + 
+  ggtitle("Astrocytes: Top PD-Associated Biological Pathways") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+# ====================================================================
+# PHASE 4f: PATHWAY ENRICHMENT (OLIGODENDROCYTES)
+# ====================================================================
+
+# 1. Load the toolbelt
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ggplot2)
+library(dplyr)
+
+# 2. Load the Oligodendrocytes CSV 
+oligo_de <- read.csv("~/Desktop/PD_Project_Fresh/DE_Oligodendrocytes.csv", row.names = 1)
+
+# 3. Filter for ONLY the significantly altered genes
+oligo_sig <- oligo_de %>%
+  filter(p_val_adj < 0.05 & abs(avg_log2FC) > 0.25)
+
+# 4. Extract just the gene names
+oligo_genes <- oligo_sig$Gene_Symbol
+
+# 5. Translate the Gene Symbols into Entrez IDs 
+oligo_entrez <- mapIds(org.Hs.eg.db, 
+                       keys = oligo_genes, 
+                       column = "ENTREZID", 
+                       keytype = "SYMBOL", 
+                       multiVals = "first")
+
+oligo_entrez <- na.omit(oligo_entrez)
+
+# 6. Run the Enrichment
+oligo_go <- enrichGO(gene          = oligo_entrez,
+                     OrgDb         = org.Hs.eg.db,
+             ont           = "BP", 
+             pAdjustMethod = "BH",
+             pvalueCutoff  = 0.05,
+             readable      = TRUE)
+
+# 7. plot 
+dotplot(oligo_go, showCategory = 15) + 
+  ggtitle("Oligodendrocytes: Top PD-Associated Biological Pathways") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+
+# PHASE 5: BIOLOGICAL SYNTHESIS TABLE (UPGRADED)
+
+# PHASE 5: BIOLOGICAL SYNTHESIS TABLE
+# ====================================================================
+
+# 1. Load the table rendering library
+library(knitr)
+
+# 2. Build the data table row by row
+pd_summary <- data.frame(
+  Cell_Type = c("Microglia", 
+                "Dopaminergic Neurons", 
+                "Astrocytes", 
+                "Oligodendrocytes"),
+  
+  Core_Biological_Failure = c("Lysosomal Overload / Garbage Disposal", 
+                              "Synaptic & Axonal Breakdown", 
+                              "Lipid / Cholesterol Supply Chain", 
+                              "Myelin Maintenance & Production"),
+  
+  Top_Implicated_Pathways = c("Response to unfolded protein, Lysosome localization", 
+                              "Modulation of chemical synaptic transmission", 
+                              "Glycerolipid & cholesterol metabolic process", 
+                              "Phospholipid metabolic process, Axonogenesis")
+)
+
+# 3. Print the table beautifully
+kable(pd_summary, 
+      col.names = c("Cell Type", "Biological Failure", "Top Implicated Pathways"),
+      caption = "Summary of PD-Associated Biological Failures by Cell Type",
+      align = "l")
+
+```
+
+### Phase 4 Validation: Donor-Level Pseudobulk Results
+
+To ensure the single-cell pathway signatures are robust across individual patients, pseudobulk validation was performed using DESeq2. The raw counts were aggregated by Patient ID and Cell Type. 
+
+Below are the top significant genes (padj < 0.05) driving the disease signatures in Astrocytes and OPCs.
+
+```{r, message=FALSE, warning=FALSE}
+# Load the pre-calculated DESeq2 results
+astro_results <- read.csv("~/Desktop/PD_Project_Fresh/Astrocytes_Pseudobulk_Results.csv")
+opc_results <- read.csv("~/Desktop/PD_Project_Fresh/OPCs_Pseudobulk_Results.csv")
+
+# Print clean tables for the HTML report
+knitr::kable(head(astro_results, 10), 
+             caption = "Top 10 Significant Genes in Astrocytes (PD vs Control)")
+
+knitr::kable(head(opc_results, 10), 
+             caption = "Top 10 Significant Genes in OPCs (PD vs Control)")
+```
+
+### Phase 5: Pathway Enrichment (Gene Ontology)
+
+To understand the broader biological impact of the significant genes identified in our pseudobulk validation, we performed Gene Ontology (GO) enrichment analysis. The bubble plot below highlights the top biological processes disrupted in Parkinson's disease Astrocytes, specifically pointing to protein misfolding and metabolic stress.
+
+```{r, fig.width=8, fig.height=7, message=FALSE, warning=FALSE}
+# Load the pathway libraries
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ggplot2)
+
+# Load the Astrocytes results we saved earlier
+astro_results <- read.csv("Astrocytes_Pseudobulk_Results.csv")
+
+# Filter for genes using the raw p-value to cast a wider net
+sig_astro_broad <- subset(astro_results, pvalue < 0.05 & !is.na(Gene_Symbol))
+significant_genes_broad <- sig_astro_broad$Gene_Symbol
+
+# Run the Gene Ontology (GO) Enrichment Math
+ego_astro_broad <- enrichGO(gene          = significant_genes_broad,
+                            OrgDb         = org.Hs.eg.db,
+                            keyType       = "SYMBOL",
+                            ont           = "BP",  
+                            pAdjustMethod = "BH",
+                            pvalueCutoff  = 0.05,
+                            qvalueCutoff  = 0.05)
+
+# Generate the Bubble Plot
+dotplot(ego_astro_broad, showCategory = 10, title = "Top Enriched Pathways in Astrocytes (PD vs Control)")
+```

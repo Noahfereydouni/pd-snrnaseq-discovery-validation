@@ -1,0 +1,298 @@
+
+---
+title: "Cross-Cohort Validation Analysis: GSE184950 (Wang et al., 2024)"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# This hides the messy loading text from the final report
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(Seurat)
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(enrichR) # Added to fix the pathway analysis
+
+```
+
+#Summary 
+This report details the processing, differential expression, and targeted replication analysis of the independent GSE184950 single-nucleus RNA sequencing (snRNA-seq) validation dataset (Wang et al., 2024; postmortem substantia nigra, 34 samples).
+
+#Objective:
+To test the cross-cohort reproducibility of a 6-gene candidate panel (CHI3L1, NEAT1, MOBP, PBX1, EN2, LINGO1) and Tyrosine Hydroxylase (TH) originally nominated from primary discovery cohort (GSE157783).
+
+#Methodology:
+While the full published GSE184950 dataset contains 315,867 high-quality nuclei, this validation analysis applied targeted quality control filtering and computational subsetting to isolate only the specific high confidence neural and glial cell populations required to mirror the primary discovery pipeline. This targeted isolation shows approximately 84,000 nuclei for downstream evaluation. Differential expression across these populations was then performed utilizing a sex-corrected logistic regression framework (test.use = "LR", latent.vars = "Sex") to ensure the resulting signatures reflect the disease state rather than demographic variance.
+
+#Key Findings:
+As detailed in the final manuscript, this analysis confirms the robust replication of specific glial signatures (NEAT1 in astrocytes; MOBP in oligodendrocytes). Furthermore, it quantitatively confirms the non-replication of the dopaminergic-neuron-specific candidates (PBX1, EN2) and shows a significant, cohort specific directional reversal of TH expression, underscoring the importance of independent cross-cohort validation in snRNA-seq studies.
+---
+```{r load_data}
+print("==============================================")
+print("1. LOADING & FILTERING THE VALIDATION DATASET")
+print("==============================================")
+# Fast-load the completed Seurat object
+validation_obj <- readRDS(path.expand("~/Desktop/PD_Project_Fresh/03_Quarantine_Validation/val_seurat_final_annotated.rds"))
+
+# Mathematically strip out the Endothelial cells and unannotated clusters
+val_clean <- subset(validation_obj, 
+                    idents = c("Oligodendrocyte", "Microglia", "Astrocyte", 
+                               "Excitatory Neuron", "Inhibitory Neuron", 
+                               "OPC", "Dopaminergic Neuron"))
+
+# Bulletproof step: explicitly force Seurat to use the cell_type column
+Idents(val_clean) <- "cell_type"
+
+# Clean up memory
+rm(validation_obj)
+gc()
+```
+
+
+The following UMAP shows the targeted cellular landscape. The legend was used to identify the distinct cell types based on canonical markers.
+
+```{r umap_plot_fig4, fig.width=8, fig.height=7, message=FALSE, warning=FALSE, dpi=300} 
+# Generate the corrected Figure 5 for the manuscript using the filtered data
+fig5 <- DimPlot(val_clean, reduction = "umap", label = TRUE, repel = TRUE) +
+  ggtitle("Cellular Ecosystem of the Human Brain (GSE184950 - Filtered)") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+# Print to the Rmd document
+print(fig5)
+
+# Export specifically for Figure 5 in the manuscript
+ggsave("Manuscript_Fig5_UMAP_Filtered.pdf", plot = fig5, width = 8, height = 7, dpi = 600)
+```
+
+
+
+
+```{r ambient_rna_qc_check, fig.width=12, fig.height=6, echo=TRUE, message=FALSE, warning=FALSE}
+# Test 1: The Visual Distribution (Soup vs. Signal) 
+# Plot the questionable genes alongside a true OPC marker (PDGFRA) and a true Astrocyte marker (GFAP)
+FeaturePlot(val_clean, 
+            features = c("NEAT1", "CHI3L1", "PDGFRA", "GFAP"), 
+            ncol = 2, 
+            pt.size = 0.5)
+            
+# Test 2: The Doublet Check (Co-expression)
+# Check the expression levels across all cell types
+VlnPlot(val_clean, 
+        features = c("NEAT1", "CHI3L1"), 
+        pt.size = 0)
+```
+---
+
+## Part 2: Differential Expression in Dopaminergic Neurons
+To understand the disease mechanisms, the Dopaminergic Neuron cluster was isolated, and differential gene expression analysis was performed by comparing Parkinson's disease patients with unaffected controls. Because the dataset exhibited a substantial sex bias, a logistic regression model (test.use = "LR") was applied with Sex included as a latent variable to account for sex-related variation.
+
+
+
+```{r differential_expression_da, fig.width=8, fig.height=7, message=FALSE, warning=FALSE}
+# Isolate Dopaminergic Neurons from the clean object
+dopa_neurons <- subset(val_clean, idents = "Dopaminergic Neuron")
+Idents(dopa_neurons) <- "Diagnosis"
+
+# Run Sex-Corrected Math
+pd_vs_control_corrected <- FindMarkers(dopa_neurons, 
+                                       ident.1 = "Parkinson's Disease", 
+                                       ident.2 = "Unaffected Control",
+                                       test.use = "LR",                 
+                                       latent.vars = "Sex",             
+                                       min.pct = 0.1, 
+                                       logfc.threshold = 0.25)
+```
+
+
+## Part 3: Molecular Signature (Volcano Plot)
+The volcano plot below highlights the statistically significant gene expression changes driving the disease state. Note the severe downregulation of Tyrosine Hydroxylase (TH) and the upregulation of mitochondrial survival genes (MTRNR2L1).
+
+
+```{r volcano_plot, fig.width=10, fig.height=7, dpi=300, message=FALSE, warning=FALSE}
+# 1. Prepare data for plotting (THESE ARE THE LINES YOU ACCIDENTALLY DELETED)
+volcano_data <- pd_vs_control_corrected
+volcano_data$gene <- rownames(volcano_data)
+
+volcano_data <- volcano_data %>%
+  mutate(Expression = case_when(
+    avg_log2FC >= 0.25 & p_val_adj <= 0.05 ~ "Upregulated in PD",
+    avg_log2FC <= -0.25 & p_val_adj <= 0.05 ~ "Downregulated in PD",
+    TRUE ~ "Not Significant"
+  ))
+
+# 2. Highlight top targets (WITH THE BACKSLASHES REMOVED)
+top_genes <- unique(c(head(volcano_data[order(volcano_data$p_val_adj), "gene"], 15), 
+                      "TH", "MTRNR2L1", "MT-ND4L", "NXPH1"))
+volcano_data$label <- ifelse(volcano_data$gene %in% top_genes, volcano_data$gene, "")
+
+# 3. Draw Volcano and store it in a variable
+volcano_fig <- ggplot(volcano_data, aes(x = avg_log2FC, y = -log10(p_val_adj), color = Expression, label = label)) +
+  geom_point(alpha = 0.8, size = 1.5) +
+  scale_color_manual(values = c("Downregulated in PD" = "#2c7bb6", 
+                                "Not Significant"   = "#cccccc",  
+                                "Upregulated in PD" = "#d7191c")) + 
+  geom_vline(xintercept = c(-0.25, 0.25), linetype = "dashed", color = "black", alpha = 0.5) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black", alpha = 0.5) +
+  geom_text_repel(max.overlaps = 50, box.padding = 0.5, size = 4, color = "black", fontface = "bold") +
+  theme_classic() +
+  labs(title = "Molecular Signature of Parkinson's Disease",
+       subtitle = "Dopaminergic Neurons (Sex-Bias Corrected)",
+       x = "Log2 Fold Change",
+       y = "-Log10(Adjusted P-Value)") +
+  theme(legend.position = "bottom",
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+        plot.subtitle = element_text(hjust = 0.5, size = 12))
+
+# 4. Print to the Rmd document
+print(volcano_fig)
+
+# 5. Export for the actual manuscript
+ggsave("Manuscript_Volcano_Plot.pdf", plot = volcano_fig, width = 10, height = 7, dpi = 600)
+```
+
+
+
+## Part 4: Pathway Enrichment (Gene Ontology)
+To understand the functional consequences of the differential expression, a Gene Ontology (GO) enrichment analysis was performed on the downregulated genes using the 2023 Biological Process database. This analysis shows the specific cellular systems that are disrupted in the PD patients.
+
+
+```{r pathway_analysis, fig.width=10, fig.height=6}
+# Load the string manipulation toolbox
+library(stringr)
+# 1. Run the actual enrichR math on the downregulated genes
+dbs <- c("GO_Biological_Process_2023")
+down_genes <- volcano_data %>% filter(avg_log2FC <= -0.25 & p_val_adj <= 0.05) %>% pull(gene)
+down_pathways <- enrichr(down_genes, dbs)
+
+# 2. Process the enrichR output and parse the Overlap ratio into a numeric count
+enrich_res <- down_pathways[[1]] %>%
+  head(10) %>%
+  mutate(Count = as.numeric(sub("/.*", "", Overlap))) %>%
+  mutate(Term = str_replace(Term, " \\(GO:[0-9]+\\)$", "")) %>%
+  mutate(Term = factor(Term, levels = rev(Term)))
+
+# 3. Generate the high-density publication Dot Plot with fixed integer axes
+go_dot_plot <- ggplot(enrich_res, aes(x = Count, y = Term, color = Adjusted.P.value, size = Count)) +
+  geom_point(alpha = 0.9) +
+  scale_color_viridis_c(direction = -1, option = "plasma") + 
+  scale_x_continuous(breaks = c(1, 2), limits = c(0.5, 2.5)) +
+  theme_bw() +
+  labs(title = "Gene Ontology Biological Processes",
+       subtitle = "Downregulated Signatures in Dopaminergic Neurons (GSE184950)",
+       x = "Number of Downregulated Genes",
+       y = "",
+       color = "Adj. P-Value",
+       size = "Gene Count") +
+  theme(
+    plot.title = element_text(hjust = 0, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0, size = 11, face = "italic"),
+    axis.text.y = element_text(size = 11, color = "black"),
+    axis.text.x = element_text(size = 11, color = "black"),
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  )
+
+# Print to your R Markdown document
+print(go_dot_plot)
+
+# 4. Save directly with scaled dimensions for maximum crispness at 600 DPI
+output_dir <- path.expand("~/Desktop/PD_Project_Fresh/03_Quarantine_Validation")
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+ggsave(filename = file.path(output_dir, "Manuscript_Fig7_GO_Enrichment.png"), 
+       plot = go_dot_plot, width = 12, height = 7.5, dpi = 600, bg = "white")
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+library(knitr)
+
+# Create the curated dataset containing verified genetic data
+pd_gene_validation <- data.frame(
+  Gene = c("**PBX1**", "**EN2**", "**LINGO1**", "**CHI3L1**", "**NEAT1**", "**MOBP**"),
+  Cell_Type = c("DA Neuron", "DA Neuron", "DA Neuron / Glia", "Astrocyte (Microglia-interacting)", "Neurons (DA Neurons / SH-SY5Y)", "Oligodendrocyte"),
+  Associated_Pathway_GO = c("Response to Unfolded Protein", "Proteostasis & Mitochondrial Translation", "Negative Regulation of Axonogenesis", "Inflammatory Response (GO:0006954)", "Apoptosis & alpha-Synuclein Regulation", "Axon Development & Synaptic Assembly"),
+  Known_in_PD = c("Yes", "Yes", "Yes", "Yes", "Yes", "Yes"),
+  Is_it_Novel = c("No", "No", "No", "No", "No", "No"),
+  Supporting_Literature = c(
+    "[Sakharkar et al., 2019 (Ref. 3)](https://doi.org/10.1371/journal.pone.0220995)",
+    "[Rekaik et al., 2015 (Ref. 4)](https://doi.org/10.1016/j.febslet.2015.10.002)",
+    "[Inoue et al., 2007 (Ref. 5)](https://doi.org/10.1073/pnas.0700901104)",
+    "[Gong et al., 2025 (Ref. 6)](https://doi.org/10.1016/j.heliyon.2025.e42051)",
+    "[Liu & Lu, 2018 (Ref. 7)](https://doi.org/10.1111/1440-1681.12932)",
+    "[Martirosyan et al., 2024 (Ref. 8)](https://doi.org/10.1186/s13024-023-00699-0)"
+  ),
+  stringsAsFactors = FALSE
+)
+
+# Render the table in markdown format for report generation
+kable(
+  pd_gene_validation,
+  col.names = c("Gene", "Cell Type", "Associated Pathway (from GO)", "Known in PD?", "Is it Novel?", "Supporting Literature"),
+  align = c("l", "l", "l", "c", "c", "l"),
+  caption = "Table 1: Novelty & Pathway Validation of Cell-Type-Specific Signatures in Parkinson's Disease"
+)
+```
+
+```{r validation_stats, warning=FALSE, message=FALSE}
+# ====================================================================
+# FINAL VALIDATION STATS FOR MANUSCRIPT (6-GENE PANEL)
+# ====================================================================
+
+# 1. Microglia
+microglia <- subset(val_clean, idents = "Microglia")
+Idents(microglia) <- "Diagnosis"
+microglia_stats <- FindMarkers(microglia, 
+                               ident.1 = "Parkinson's Disease", 
+                               ident.2 = "Unaffected Control",
+                               test.use = "LR",                 
+                               latent.vars = "Sex",             
+                               min.pct = 0.1, 
+                               logfc.threshold = 0.25)
+write.csv(microglia_stats, "Microglia_validation_stats.csv")
+
+# 2. Astrocytes
+astrocytes <- subset(val_clean, idents = "Astrocyte")
+Idents(astrocytes) <- "Diagnosis"
+astro_stats <- FindMarkers(astrocytes, 
+                           ident.1 = "Parkinson's Disease", 
+                           ident.2 = "Unaffected Control",
+                           test.use = "LR",                 
+                           latent.vars = "Sex",             
+                           min.pct = 0.1, 
+                           logfc.threshold = 0.25)
+write.csv(astro_stats, "Astrocytes_validation_stats.csv")
+
+# 3. Oligodendrocytes
+oligo <- subset(val_clean, idents = "Oligodendrocyte")
+Idents(oligo) <- "Diagnosis"
+oligo_stats <- FindMarkers(oligo, 
+                           ident.1 = "Parkinson's Disease", 
+                           ident.2 = "Unaffected Control",
+                           test.use = "LR",                 
+                           latent.vars = "Sex",             
+                           min.pct = 0.1, 
+                           logfc.threshold = 0.25)
+write.csv(oligo_stats, "Oligodendrocytes_validation_stats.csv")
+
+# ====================================================================
+# AUTOMATED DATA EXTRACTION
+# ====================================================================
+
+# This will pull the targeted genes
+da_genes <- pd_vs_control_corrected[rownames(pd_vs_control_corrected) %in% c("PBX1", "EN2", "LINGO1"), ]
+mic_genes <- microglia_stats[rownames(microglia_stats) %in% c("CHI3L1"), ]
+ast_genes <- astro_stats[rownames(astro_stats) %in% c("NEAT1"), ]
+oli_genes <- oligo_stats[rownames(oligo_stats) %in% c("MOBP"), ]
+
+cat("\n--- DA Neurons (PBX1, EN2, LINGO1) ---\n")
+print(da_genes)
+cat("\n--- Microglia (CHI3L1) ---\n")
+print(mic_genes)
+cat("\n--- Astrocytes (NEAT1) ---\n")
+print(ast_genes)
+cat("\n--- Oligodendrocytes (MOBP) ---\n")
+print(oli_genes)
+```
+
