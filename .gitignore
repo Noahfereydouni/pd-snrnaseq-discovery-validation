@@ -1,0 +1,25 @@
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# knitr / rmarkdown intermediates
+*_cache/
+*_files/
+*.html
+*.knit.md
+*.utf8.md
+
+# Large objects — do not commit
+*.rds
+*.h5
+*.h5ad
+*.mtx
+matrix.mtx
+barcodes*.tsv
+features*.tsv
+
+# OS
+.DS_Store
+Thumbs.db
