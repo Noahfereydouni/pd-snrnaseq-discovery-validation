@@ -46,9 +46,9 @@ scripts/
 
 results/
       Committed analysis outputs: per-cell-type nucleus-level DE for the primary cohort
-      (DE_Microglia, DE_Astrocytes, DE_Oligodendrocytes, DE_Dopaminergic_Neurons, DE_OPCs)
-      and the donor-level astrocyte pseudobulk DESeq2 result. See results/README.md for
-      column definitions, which table or figure each file backs, and provenance notes.
+      (DE_Microglia, DE_Astrocytes, DE_Oligodendrocytes, DE_Dopaminergic_Neurons, DE_OPCs).
+      See results/README.md for column definitions, which table or figure each file backs,
+      and provenance notes.
 ```
 
 ## Provenance
@@ -122,8 +122,10 @@ that check are recorded below so the provenance of each reported number is trace
    rarest population in the dataset and is not used. The specific QC thresholds that differ
    between the two runs remain to be documented.
 
-7. **Donor-level pseudobulk for microglia and OPCs.** DESeq2 results for these two cell types
-   have not been exported to distinct filenames. Section 3.4 currently reports astrocytes only.
+7. **Donor-level pseudobulk exports.** No DESeq2 pseudobulk result is committed. The astrocyte
+   file was present but held no data and has been removed; the microglia and OPC runs were
+   never exported to distinct filenames. Section 3.4 reports the astrocyte result, which is
+   reproducible from script 02 but is not currently backed by a committed export.
 
 8. **Figure provenance for the validation UMAP.** The panel in the manuscript is the
    pre-subsetting UMAP (title "Cellular Ecosystem of the Human Brain GSE184950", endothelial

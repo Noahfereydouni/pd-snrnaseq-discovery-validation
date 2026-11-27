@@ -1,7 +1,7 @@
 # results/
 
 Analysis outputs backing the numbers reported in the manuscript. All files are Seurat
-`FindMarkers()` or DESeq2 exports produced by the scripts in `../scripts/`.
+`FindMarkers()` exports produced by the scripts in `../scripts/`.
 
 ## Nucleus-level differential expression, primary cohort (GSE157783)
 
@@ -23,13 +23,11 @@ read as pseudobulk.
 
 ## Donor-level pseudobulk, primary cohort (GSE157783)
 
-`Astrocytes_Pseudobulk_DESeq2.csv` — DESeq2 output, columns `baseMean`, `log2FoldChange`,
-`lfcSE`, `stat`, `pvalue`, `padj`, `Gene_Symbol`. Backs Section 3.4. No gene reaches
-significance after Benjamini–Hochberg correction across 25,503 tested genes; the minimum
-adjusted p-value in the file is 1.0. This is the reported result, not a truncated export.
-
-Equivalent DESeq2 exports for microglia and OPCs are not yet available; see open item 7 in
-the top-level README.
+No pseudobulk export is committed here. The astrocyte DESeq2 result reported in Section 3.4,
+where no gene reaches significance after Benjamini–Hochberg correction across 25,503 tested
+genes, is reproducible from `../scripts/02_primary_cohort_pseudobulk_DESeq2.Rmd`, but the CSV
+itself is not in this repository. The microglia and OPC runs were never exported to distinct
+filenames either. See open item 7 in the top-level README.
 
 ## Provenance note on the dopaminergic export
 
